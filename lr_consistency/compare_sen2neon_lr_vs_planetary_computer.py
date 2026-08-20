@@ -7,7 +7,7 @@ grid, applies the LR validity mask, and writes metrics plus RGB figures.
   pip install numpy rasterio matplotlib pandas pystac-client planetary-computer huggingface_hub
 
   python lr_consistency/compare_sen2neon_lr_vs_planetary_computer.py \\
-    --sample-id 2018_MLBS_3__1_1 --out-dir ./out
+    --sample-id 2018_MLBS_3__1_1
 """
 
 from __future__ import annotations
@@ -329,13 +329,25 @@ def main() -> None:
         default="2018_MLBS_3__1_1",
         help="SEN2NEON tile id (default: clean sample with no nodata holes)",
     )
-    ap.add_argument("--out-dir", type=Path, default=Path("sen2neon_vs_pc_compare"))
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory (default: "
+            "lr_consistency/reproduction_results/archive_<sample-id>)"
+        ),
+    )
     ap.add_argument("--footprints-csv", type=Path, default=None)
     ap.add_argument("--no-download", action="store_true", help="Require local HF files only")
     args = ap.parse_args()
 
     sample_id = Path(args.sample_id).stem
-    out = args.out_dir
+    out = args.out_dir or (
+        Path(__file__).resolve().parent
+        / "reproduction_results"
+        / f"archive_{sample_id}"
+    )
     out.mkdir(parents=True, exist_ok=True)
 
     if args.no_download:
