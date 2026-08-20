@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Compare SEN2NEON HF LR to same-date Sentinel-2 L2A from Planetary Computer.
+"""Compare corrected SEN2NEON S2 LR to same-date Planetary Computer S2 L2A.
 
-Downloads the HF sample (if missing), fetches matching S2 from PC, warps to the HF
-grid, applies HF mask (any band > 0), writes metrics + RGB figures.
+Downloads the HF sample (if missing), fetches matching S2 from PC, warps to the LR
+grid, applies the LR validity mask, and writes metrics plus RGB figures.
 
   pip install numpy rasterio matplotlib pandas pystac-client planetary-computer huggingface_hub
 
-  python compare_sen2neon_lr_vs_planetary_computer.py \\
+  python lr_consistency/compare_sen2neon_lr_vs_planetary_computer.py \\
     --sample-id 2018_MLBS_3__1_1 --out-dir ./out
 """
 
@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,10 +24,7 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject, transform_bounds
 
-HF_REPO = "simon-donike/SEN2NEON"
-METADATA_URL = (
-    "https://raw.githubusercontent.com/ESAOpenSR/SEN2NEON/main/data/metadata/sen2neon_metadata.csv"
-)
+HF_REPO = "isp-uv-es/SEN2NEON"
 BANDS = [
     "B01", "B02", "B03", "B04", "B05", "B06",
     "B07", "B08", "B8A", "B09", "B11", "B12",
@@ -38,6 +34,7 @@ RGB = (3, 2, 1)  # B04, B03, B02
 
 def find_footprints(root: Path) -> Path:
     for p in (
+        root / "metadata.csv",
         root / "resources" / "sen2neon_footprints.csv",
         root / "resources" / "sen2neon_foorprints.csv",
         root / "resources" / "sen2neon_metadata_full.csv",
@@ -49,7 +46,7 @@ def find_footprints(root: Path) -> Path:
 
 
 def ensure_sen2neon(root: Path, sample_id: str) -> Path:
-    """Download sample metadata + HF LR/HR tiles if missing."""
+    """Download current metadata plus corrected S2 LR and NEON HR tiles."""
     from huggingface_hub import hf_hub_download
 
     root.mkdir(parents=True, exist_ok=True)
@@ -58,13 +55,17 @@ def ensure_sen2neon(root: Path, sample_id: str) -> Path:
     try:
         meta = find_footprints(root)
     except FileNotFoundError:
-        meta = root / "resources" / "sen2neon_metadata_full.csv"
-        meta.parent.mkdir(parents=True, exist_ok=True)
+        meta = root / "metadata.csv"
         print(f"Downloading metadata → {meta}")
-        urllib.request.urlretrieve(METADATA_URL, meta)
+        hf_hub_download(
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            filename="metadata.csv",
+            local_dir=str(root),
+        )
 
     for rel in (
-        f"neon_10m_linearized/{stem}.tif",
+        f"s2_l2a_10m/{stem}.tif",
         f"neon_2.5m_linearized/{stem}.tif",
     ):
         dest = root / rel
@@ -97,7 +98,15 @@ def footprint_row(csv_path: Path, sample_id: str) -> dict:
 def s2_date(row: dict) -> str:
     if row.get("s2_date") and str(row["s2_date"]) not in ("nan", "None"):
         return str(row["s2_date"])[:10]
-    m = re.search(r"(20\d{6})T", str(row.get("s2_full_asset_id") or row.get("s2_l2a_gee") or ""))
+    m = re.search(
+        r"(20\d{6})T",
+        str(
+            row.get("s2_asset_id")
+            or row.get("s2_full_asset_id")
+            or row.get("s2_l2a_gee")
+            or ""
+        ),
+    )
     if not m:
         raise ValueError("no s2_date in footprints row")
     d = m.group(1)
@@ -335,13 +344,19 @@ def main() -> None:
         footprints = args.footprints_csv or ensure_sen2neon(args.sen2neon_root, sample_id)
 
     row = footprint_row(footprints, sample_id)
-    lr_path = args.sen2neon_root / "neon_10m_linearized" / f"{sample_id}.tif"
+    lr_rel = str(row.get("lr") or f"s2_l2a_10m/{sample_id}.tif")
+    lr_path = args.sen2neon_root / lr_rel
     if not lr_path.is_file():
         raise FileNotFoundError(lr_path)
 
     date = s2_date(row)
     neon = str(row.get("neon_date") or "")[:10] or None
-    asset = str(row.get("s2_full_asset_id") or row.get("s2_l2a_gee") or "")
+    asset = str(
+        row.get("s2_asset_id")
+        or row.get("s2_full_asset_id")
+        or row.get("s2_l2a_gee")
+        or ""
+    )
 
     with rasterio.open(lr_path) as ds:
         hf = ds.read().astype(np.float32)
@@ -349,12 +364,13 @@ def main() -> None:
         h, w = ds.height, ds.width
         profile = ds.profile.copy()
         bbox = list(transform_bounds(ds.crs, "EPSG:4326", *ds.bounds))
+        valid_mask = np.all(ds.read_masks() > 0, axis=0)
 
     item = query_pc(bbox, date, asset)
     print(f"{sample_id}: S2={date} NEON={neon} PC={item.id}")
 
     pc = warp_to_grid(item, transform, crs, h, w)
-    mask = np.any(hf > 0, axis=0)
+    mask = valid_mask & np.any(hf > 0, axis=0)
     hf_hr = load_hr(args.sen2neon_root, sample_id)
     result = metrics(hf, pc, mask)
     result.update(

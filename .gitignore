@@ -8,6 +8,7 @@ trash/
 visualizations/
 create_grids.py
 lr_consistency/reproduction_results
+paper
 
 # Lighting and Model stuff
 *.ckpt
